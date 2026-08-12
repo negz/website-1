@@ -1,0 +1,212 @@
+---
+title: "Modelplane v0.3: Vultr, the Anthropic Messages API, and testing without a GPU"
+description: "Modelplane v0.3 adds Vultr VKE as an inference cluster provider, serves the Anthropic Messages API end to end so tools like Claude Code run against your own GPUs, improves multi-node scheduling, and adds local end-to-end testing that needs no cloud and no GPU."
+date: "2026-08-12"
+authors:
+  - name: "Christopher Haar"
+    title: "Staff Software Engineer, Upbound"
+    url: "https://github.com/haarchri"
+    avatar: "/authors/haarchri.png"
+    github: "https://github.com/haarchri"
+    bio: "Christopher is a Software Engineer at Upbound working on open source. He's a maintainer of Crossplane and several providers in its ecosystem, and a regular contributor across the community. He brings years of experience building enterprise infrastructure across Telco, Railway, Finance, and Cloud."
+tags: ["release", "inference", "community"]
+cover: "/blog/modelplane-v0-3/cover.png"
+draft: false
+pinned: true
+---
+
+Modelplane v0.3 is out, our third release in the two months since we open
+sourced the project. Release by release, Modelplane is growing into its mission:
+bringing together the models, engines, clouds, and accelerators that make up the
+intelligence ecosystem so you can operate them as a single system under your
+control. And we are building it in the open.
+
+This release adds Vultr as an inference cluster provider, serves the Anthropic
+Messages API end to end so tools like Claude Code can run against your own GPUs,
+improves multi-node scheduling, and ships three new model recipes. It also adds
+something for contributors: a local end-to-end test that exercises the whole
+system with no cloud account and no GPU. Here's what's new.
+
+## Vultr joins the fleet
+
+[Vultr](https://www.vultr.com/) VKE is now an inference cluster provider,
+alongside GKE, EKS, AKS, and Nebius. As with the others, Modelplane provisions
+the full cluster: VPC, control plane, system and GPU node pools and installs
+the inference stack on top:
+
+```yaml title="vultr-cluster.yaml"
+apiVersion: modelplane.ai/v1alpha1
+kind: InferenceCluster
+metadata:
+  name: vultr-ewr
+  labels:
+    modelplane.ai/region: ewr
+spec:
+  cluster:
+    source: Vultr
+    vultr:
+      region: ewr
+  nodePools:
+  - name: gpu-l40s
+    className: vultr-l40s-1x
+    nodeCount: 1
+    minNodeCount: 1
+    maxNodeCount: 4
+```
+
+A big thank you to the folks at Vultr, who worked with us on validating the
+integration and finding the right GPU plans. This is exactly the kind of
+collaboration we hope to repeat with other clouds, more on that below.
+
+## One control plane, many accounts
+
+Until now, every `InferenceCluster` authenticated through a single
+`ClusterProviderConfig` named `default`, which quietly limited a fleet to one
+AWS account, one GCP project, one Azure subscription per cloud. v0.3 lifts
+that: every cluster type now takes a `credentials` reference, so each
+`InferenceCluster` can name the `ProviderConfig` or `ClusterProviderConfig` it
+provisions through:
+
+```yaml title="research-cluster.yaml"
+apiVersion: modelplane.ai/v1alpha1
+kind: InferenceCluster
+metadata:
+  name: vultr-research
+spec:
+  cluster:
+    source: Vultr
+    vultr:
+      region: ewr
+      credentials:
+        type: ClusterProviderConfig
+        name: project-research
+```
+
+One control plane can now provision clusters across team accounts, projects, and
+subscriptions, a production fleet in one account and experiments in another,
+without running a second Modelplane. Omit `credentials` and everything behaves
+as before, using the `ClusterProviderConfig` named `default`.
+
+## Claude Code on your own GPUs
+
+Modelplane now serves the Anthropic Messages API end to end. A vLLM server
+registers `/v1/messages` alongside its OpenAI routes, and Modelplane's routing
+preserves the path below the `/<namespace>/<service>/` prefix, so the same
+`ModelService` URL answers both `/v1/chat/completions` and `/v1/messages`:
+
+```bash
+ADDRESS=$(kubectl get ms qwen3-8b -n ml-team -o jsonpath='{.status.address}')
+
+curl "$ADDRESS/v1/messages" \
+  -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "qwen",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+Any client that speaks the Messages API works, including Claude Code: point
+`ANTHROPIC_BASE_URL` at the service address and map its model tiers onto the
+served model name:
+
+```bash
+export ANTHROPIC_BASE_URL="$ADDRESS"
+export ANTHROPIC_AUTH_TOKEN=dummy
+export ANTHROPIC_DEFAULT_OPUS_MODEL=qwen
+export ANTHROPIC_DEFAULT_SONNET_MODEL=qwen
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192
+claude
+```
+
+The details that make this actually work, the tool-calling flags that let
+Claude Code's tool use function, and why you need to cap output tokens on a
+small model, are in the
+[Anthropic Messages API recipe](https://docs.modelplane.ai/examples/anthropic-messages-api/).
+
+## Multi-node scheduling improvements
+
+Multi-node serving got two quality-of-life improvements. Modelplane now injects
+`MODELPLANE_RANK` into every pod of a multi-node gang, 0 on the leader,
+1 through N on the workers, alongside the existing
+`MODELPLANE_LEADER_ADDRESS`, so a single worker template fans out to any number
+of nodes:
+
+```yaml
+args:
+- "--nnodes=2"
+- "--node-rank=$(MODELPLANE_RANK)"
+- "--master-addr=$(MODELPLANE_LEADER_ADDRESS)"
+```
+
+And labels and annotations on a member's pod template now propagate through the
+composed workloads to the pods themselves, which is what you need for
+cluster-level features like service mesh injection:
+
+```yaml
+template:
+  metadata:
+    labels:
+      team: ml-platform
+    annotations:
+      sidecar.istio.io/inject: "true"
+```
+
+Malformed keys, and labels under the reserved `modelplane.ai/` prefix, are
+rejected at admission rather than failing later on the workload cluster.
+
+## Three new recipes
+
+The [examples](https://docs.modelplane.ai/examples/) grew by three:
+
+- **[Nemotron-3.5-Lightning](https://docs.modelplane.ai/examples/nemotron-3.5-lightning/)**
+  on a Nebius H100, the recipe behind [yesterday's day-zero
+  post](/blog/nemotron-3-5-lightning-day-zero).
+- **[Laguna-S-2.1](https://docs.modelplane.ai/examples/laguna/)** Poolside's
+  118B code MoE (8B active) served FP8, tensor-parallel across a single 8x H100
+  node on Nebius.
+- **[Qwen2.5-72B](https://docs.modelplane.ai/examples/qwen2.5-72b/)** a 72B
+  dense model from an AWQ INT4 quantization on a single 80 GB GPU per replica,
+  with platform manifests for both an A100 on AKS and an H100 on Nebius. The ML
+  side is the same manifest for both, and the recipe ends by using weighted
+  routing to split traffic between the two GPUs and compare them.
+
+## Test Modelplane with no cloud and no GPU
+
+v0.3 adds a local two-cluster end-to-end test that runs the full Modelplane
+path, publish capacity, register a cluster, deploy a model, route a request
+through the control-plane gateway, on two local `kind` clusters. A fake DRA
+driver publishes GPUs that don't exist and a mock engine answers both the
+OpenAI and Anthropic APIs, so the real scheduling, allocation, and routing
+paths run with no cloud account and no GPU.
+
+Alongside it, the Nix-based control plane setup is now complete, with failures
+surfaced directly from `nix run`. We're thrilled to see people starting to
+adopt Modelplane, and we want the first step to be as easy as possible: trying
+it out, validating a change, or building a contribution now takes an afternoon
+and a laptop with Docker, not a cloud bill.
+
+## Help us shape what's next
+
+Modelplane now provisions inference clusters on five providers and runs on any
+Kubernetes you bring. But the intelligence ecosystem is bigger than five
+clouds, there's a long tail of clouds and neoclouds we haven't integrated yet,
+and that's exactly where community contributions matter most. The provider
+pattern is established: an `InferenceClass` describes the hardware, an
+`InferenceCluster` provisions it, and the same `nodePools` model applies
+everywhere. If your GPUs live somewhere Modelplane doesn't provision yet,
+[upvote or open an issue](https://github.com/modelplaneai/modelplane/issues)
+or come talk to us about building the integration.
+
+The same goes for testing. The local end-to-end setup means you can validate
+changes, chase bugs, and try Modelplane across multiple clusters without
+spending a cent on GPUs, so kicking the tires is now a real way to contribute.
+Run it, break it, and tell us what you find.
+
+The full release notes are on
+[GitHub](https://github.com/modelplaneai/modelplane/releases/tag/v0.3.0), the
+[getting-started guide](https://docs.modelplane.ai/getting-started/) covers all
+five providers, and questions and feedback are welcome in
+[Slack](https://slack.modelplane.ai).
