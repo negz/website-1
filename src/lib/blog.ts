@@ -50,6 +50,13 @@ function readPostFile(folder: string): { data: Record<string, unknown>; content:
   return matter(raw)
 }
 
+// Drop keys whose value is undefined. getStaticProps can't serialize undefined,
+// and the author pages pass an author straight through as a prop, so an absent
+// optional field has to be missing rather than explicitly undefined.
+function withoutUndefined<T extends object>(o: T): T {
+  return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as T
+}
+
 function normalizeAuthors(input: unknown): Author[] {
   if (!Array.isArray(input)) return []
   return input
@@ -57,7 +64,7 @@ function normalizeAuthors(input: unknown): Author[] {
       if (typeof a === 'string') return { name: a }
       if (a && typeof a === 'object' && typeof (a as Author).name === 'string') {
         const author = a as Author
-        return {
+        return withoutUndefined({
           name: author.name,
           title: author.title,
           url: author.url,
@@ -66,7 +73,7 @@ function normalizeAuthors(input: unknown): Author[] {
           github: author.github,
           linkedin: author.linkedin,
           x: author.x,
-        }
+        })
       }
       return null
     })
@@ -221,14 +228,10 @@ export function getAllAuthors(): AuthorWithMeta[] {
       const slug = authorNameToSlug(a.name)
       const existing = bySlug.get(slug)
       if (existing) {
-        existing.count += 1
-        existing.title ??= a.title
-        existing.url ??= a.url
-        existing.avatar ??= a.avatar
-        existing.bio ??= a.bio
-        existing.github ??= a.github
-        existing.linkedin ??= a.linkedin
-        existing.x ??= a.x
+        // The most recent post wins, and older posts fill its gaps. Merging by
+        // spread rather than field-by-field keeps a field that's absent from
+        // every post absent, instead of setting it to undefined.
+        bySlug.set(slug, { ...a, ...existing, count: existing.count + 1 })
       } else {
         bySlug.set(slug, { ...a, slug, count: 1 })
       }
