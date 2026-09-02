@@ -1,0 +1,216 @@
+---
+title: "NVIDIA Dynamo, fleet-wide"
+description: "Modelplane inference clusters can now run NVIDIA Dynamo, adding gang scheduling and fast P2P model weight transfer."
+date: "2026-09-02"
+authors:
+  - name: "Nic Cope"
+    title: "Sr Principal Engineer, Upbound"
+    url: "https://github.com/negz"
+    avatar: "/authors/nic.jpg"
+    github: "https://github.com/negz"
+    linkedin: "https://www.linkedin.com/in/ncope/"
+    bio: "Nic is a Senior Principal Engineer at Upbound and a core maintainer of Modelplane and Crossplane. He's spent the last 15+ years working on cloud and infrastructure, including designing and building Crossplane from v0.1 through v2.0, and is now bringing that work to AI inference with Modelplane."
+tags: ["inference", "control-plane", "nvidia"]
+draft: false
+---
+
+In Modelplane v0.4 you can now choose the serving stack each Modelplane-managed
+cluster runs. We designed a new `Dynamo` serving stack in collaboration with
+NVIDIA's [Dynamo](https://developer.nvidia.com/dynamo) team.
+[Grove](https://github.com/ai-dynamo/grove) and the [KAI
+Scheduler](https://github.com/NVIDIA/KAI-Scheduler) place a multi-node engine as
+a gang, and [ModelExpress](https://github.com/ai-dynamo/modelexpress) moves
+model weights GPU to GPU between replicas.
+
+The `ModelDeployment` an ML team writes stays the same. The same manifest runs
+on either stack. Which stack a cluster runs is a platform decision, made per
+cluster, so a fleet can run both at once.
+
+## A serving stack owns one cluster
+
+Modelplane operates a fleet. It provisions inference clusters and node pools,
+schedules model replicas onto hardware that fits, and fronts the whole fleet
+with an OpenAI-compatible endpoint. It isn't a serving layer itself.
+
+A serving stack owns what happens inside one cluster. It places a multi-node
+engine's pods and gets the model's weights into GPU memory. Dynamo does both,
+and it does things Modelplane's current "standard" stack doesn't, like gang
+scheduling, P2P weight transfer, and keeping weights resident in GPU memory
+across an engine crash.
+
+## Opting a cluster in
+
+```yaml title="dynamo-cluster.yaml"
+apiVersion: modelplane.ai/v1alpha1
+kind: InferenceCluster
+metadata:
+  name: eks-h200-us-east
+spec:
+  # Standard (the default) or Dynamo. Immutable.
+  stack: Dynamo
+  cluster:
+    source: EKS
+    eks:
+      region: us-east-1
+  nodePools:
+  - name: gpu
+    className: eks-h200-8x
+    nodeCount: 2
+```
+
+On a `Dynamo` cluster Modelplane installs Grove, the KAI Scheduler, and the
+ModelExpress server. On a `Standard` cluster it installs the
+[LeaderWorkerSet](https://github.com/kubernetes-sigs/lws) controller. Everything
+else about a cluster, from how it fronts requests to how it stages model
+weights, is the same on both.
+
+The choice is immutable, so adoption is incremental. A platform team stands up a
+Dynamo cluster next to the ones it already runs and moves deployments over
+cluster by cluster.
+
+## Gang scheduling with Grove and the KAI Scheduler
+
+Gang scheduling makes the most of the GPU time you're paying for. A multi-node
+engine is a gang. Its leader and workers are useless apart. Schedule those pods
+one at a time and a gang can half-land, holding GPUs while serving nothing,
+waiting for nodes that may not be free for a while. KAI places the whole gang or
+none of it.
+
+Modelplane composes an engine onto whichever stack its cluster runs. A `Leader`
+and `Worker` gang is a LeaderWorkerSet on `Standard`, and on `Dynamo` a Grove
+`PodCliqueSet` with a leader clique and a worker clique, scheduled by KAI.
+
+So a serving stack has to run two pod specs with distinct commands, and give a
+worker a way to find its leader. Grove does both.
+
+## Weight transfer with ModelExpress
+
+Loading weights is slow. Each replica reads the model from storage before it can
+serve a token, and several replicas scaling up together compete for reads from
+the same storage. ModelExpress makes that one read rather than one per replica.
+
+A `Dynamo` cluster runs a ModelExpress server. The server remembers and
+advertises which replica holds a model in GPU memory. The first replica loads
+from the cache volume and publishes itself as a source, and later replicas pull
+the weights from a peer's GPU over RDMA, across a fast fabric like EFA on EKS. A
+replica that finds no peer, or no fabric to reach one over, reads the cache
+volume instead, so size and keep the cache for every replica on either stack.
+
+## The same manifest on either stack
+
+The ML team authors a `ModelDeployment` the same way they always have. A
+`ModelDeployment` describes the inference engines Modelplane should run. It says
+nothing about the stack underneath it.
+
+Here's a 480B model across two nodes, tensor-parallel within each node and
+pipeline-parallel across them, that also opts into ModelExpress.
+`$(MODELPLANE_LEADER_ADDRESS)` is the address the leader is reachable at, and it
+resolves on both stacks:
+
+```yaml title="qwen3-coder.yaml"
+apiVersion: modelplane.ai/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: qwen3-coder
+  namespace: ml-team
+spec:
+  replicas: 1
+  template:
+    spec:
+      modelCacheRef:
+        name: qwen3-coder
+      engines:
+      - name: qwen3-coder
+        members:
+        - role: Leader
+          nodeSelector:
+            devices:
+            # Eight GPUs per node, each with at least 120Gi of memory.
+            - name: gpu
+              count: 8
+              selectors:
+              - cel: |
+                  device.capacity["gpu.nvidia.com"].memory.compareTo(quantity("120Gi")) >= 0
+          template:
+            spec:
+              containers:
+              - name: engine
+                image: vllm/vllm-openai:v0.23.0
+                command:
+                - /bin/sh
+                - -c
+                - >-
+                  pip install --index-url https://pypi.nvidia.com modelexpress &&
+                  exec vllm serve Qwen/Qwen3-Coder-480B-A35B-Instruct
+                  --served-model-name=qwen3-coder
+                  --load-format modelexpress
+                  --tensor-parallel-size=8
+                  --pipeline-parallel-size=2
+                  --distributed-executor-backend=mp
+                  --nnodes=2 --node-rank=0
+                  --master-addr=$(MODELPLANE_LEADER_ADDRESS)
+                  --max-model-len=32768
+                  --port=8000
+        - role: Worker
+          worker:
+            nodes: 1
+          # nodeSelector is the same as the leader's. Omitted for brevity.
+          template:
+            spec:
+              containers:
+              - name: engine
+                image: vllm/vllm-openai:v0.23.0
+                command:
+                - /bin/sh
+                - -c
+                - >-
+                  pip install --index-url https://pypi.nvidia.com modelexpress &&
+                  exec vllm serve Qwen/Qwen3-Coder-480B-A35B-Instruct
+                  --served-model-name=qwen3-coder
+                  --load-format modelexpress
+                  --tensor-parallel-size=8
+                  --pipeline-parallel-size=2
+                  --distributed-executor-backend=mp
+                  --nnodes=2 --node-rank=1
+                  --master-addr=$(MODELPLANE_LEADER_ADDRESS)
+                  --headless
+                  --max-model-len=32768
+```
+
+The `modelCacheRef` names a `ModelCache`, which stages a model's weights once
+per cluster on shared storage. The `--load-format modelexpress` flag configures
+vLLM to attempt to load weights via ModelExpress. Run it on a `Standard`
+cluster, where nothing runs a ModelExpress server, and the engine reads the
+cached weights from a persistent volume just like it does today.
+
+`$(MODELPLANE_LEADER_ADDRESS)` resolves on Dynamo thanks to fast work from the
+Dynamo team. Grove used to inject its pod-discovery variables in an order that
+left a pod template unable to derive a value from them. Thanks to Stefan from
+the Dynamo team for fixing this in
+[grove#753](https://github.com/ai-dynamo/grove/pull/753)!
+
+## What's next
+
+Eventually we plan to power the `Dynamo` stack using Dynamo's
+`DynamoGraphDeployment` (DGD) custom resource. The DGD controller uses Grove,
+KAI, ModelExpress, and even more advanced technology like the GPU Memory Service
+(GMS). We're working with the Dynamo team to unlock this possibility. It depends
+on [dynamo#12696](https://github.com/ai-dynamo/dynamo/issues/12696), which would
+let an integration like Modelplane hand the operator distinct leader and worker
+pod specs, and stop it rewriting the engine command. It also depends on
+[dynamo#10835](https://github.com/ai-dynamo/dynamo/issues/10835), which would
+let a stock engine image serve in place of a Dynamo runtime image.
+
+Nearer term, the Dynamo team is also working on
+[grove#755](https://github.com/ai-dynamo/grove/pull/755), which exposes a
+scaling-group-wide pod index. That would let us alias a rank the way we alias
+the leader address, so every pod of a gang could share one command.
+
+## Try it
+
+The [getting-started guide](https://docs.modelplane.ai/getting-started/) covers
+standing up a fleet, and
+[how it works](https://docs.modelplane.ai/overview/how-it-works/) covers what a
+serving stack installs. Modelplane is Apache 2.0 and moving fast at
+[github.com/modelplaneai/modelplane](https://github.com/modelplaneai/modelplane),
+and questions are welcome in [Slack](https://slack.modelplane.ai).
